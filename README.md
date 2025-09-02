@@ -45,11 +45,9 @@ CE1{
   }
 
   flags{
-    --dry (default)
-    --apply
-    --force                     // allow branch -f
     --include-non-git           // snapshot plain dirs as orphan branches
     --prefix=<path>             // snapshot under subpath
+    -e, --event                 // materialization predicates (content,cadence,size,host-moved)
   }
 
   passport{
@@ -82,14 +80,11 @@ pip install blake3
 ### Basic Commands
 
 ```bash
-# Superpose directories as branches (dry run by default)
+# Superpose directories as branches (sandbox-first)
 python tiq.py superpose
 
-# Apply superposition
-python tiq.py superpose --apply
-
 # Include non-Git directories
-python tiq.py superpose --apply --include-non-git
+python tiq.py superpose --include-non-git
 
 # Map all branches with passports
 python tiq.py map
@@ -104,10 +99,9 @@ python tiq.py diff --left branch1 --right branch2
 ### Command Line Options
 
 - `--host <path>`: Host repository path (default: ".")
-- `--apply`: Apply changes (default: dry run)
-- `--force`: Allow force operations
 - `--include-non-git`: Include non-Git directories as orphan branches
 - `--prefix <path>`: Prefix for snapshot operations
+- `-e, --event`: Materialize predicate list: `content,cadence,size,host-moved`
 
 ## Examples
 
@@ -120,8 +114,8 @@ python tiq.py diff --left branch1 --right branch2
 # ├── backend/      (Git repo)  
 # └── docs/         (plain directory)
 
-# Superpose all as branches
-python tiq.py superpose --apply --include-non-git
+# Superpose all as branches (materialization is event-driven)
+python tiq.py superpose --include-non-git -e content
 
 # Result: project becomes a Git repo with branches:
 # - frontend
@@ -160,6 +154,17 @@ TIQ maintains several critical invariants:
 3. **No History Rewrite**: Only adds refs/objects, never rewrites
 4. **Clean State Enforcement**: Aborts on dirty repositories
 5. **Deterministic Branch Names**: Sanitizes directory names consistently
+
+### Emergent properties
+
+- **Deterministic convergence**: Repeated superpose drives the host to a fixed point; subsequent runs plan no ops beyond changed children.
+- **Reversible views**: Branches behave like lossless views over directories; extract∘superpose preserves trees.
+- **Stable identities**: Passports `§{blake3:crc}` expose content drift at a glance while staying compact.
+- **Functorial mapping**: The mapping directory → branch preserves structure; fetch updates propagate without history rewrite.
+- **Object-store economy**: Git deduplicates objects across branches, making the superposed aggregate compact.
+- **Naming lattice**: `sanitize(dir)` yields deterministic branch names; collisions resolve predictably.
+- **Minimal-churn cadence**: Per-branch touch highlights only changed dirs in maps and reports.
+- **Diff-as-dynamics**: `left..right` operates as a temporal arrow between snapshots/children inside the host index.
 
 ## Testing
 

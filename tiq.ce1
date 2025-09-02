@@ -18,11 +18,10 @@ CE1{
   }
 
   flags{
-    --dry (default)
-    --apply
-    --force                     // allow branch -f
     --include-non-git           // snapshot plain dirs as orphan branches
     --prefix=<path>             // snapshot under subpath
+    --promote=preds             // auto-promotion predicates (content,cadence,size,host-moved)
+    --timeout=<sec>             // no-op if unmet
   }
 
   passport{
@@ -30,8 +29,16 @@ CE1{
     cadence = per-branch-touch
   }
 
+  seed.dense{
+    X = (D, B, P)
+    D: dirs(host; depth=1 \ ignore)
+    B: sanitize: D → branches
+    P(b) = § blake3(tree(b))[:8] ":" crc16(meta(b))
+    Φ: D → B is idempotent, reversible-on-trees
+  }
+
   plan.superpose{
-    ensure host is clean
+    ensure host clean
     for d in dirs(host; depth=1 \ ignore):
       b = sanitize(d)
       if is_git(d):
@@ -39,8 +46,8 @@ CE1{
         remote="tiq/"+b
         add_remote_once(host, remote, d)
         fetch(host, remote, "+refs/heads/*:refs/remotes/"+remote+"/*", tags=true)
-        head = remote_head_or_first(host, remote)
-        create_branch(host, b, head, force=--force)
+        oid = resolve_oid(remote)
+        update_ref_sbx(b, oid)
       else if --include-non-git:
         switch_orphan(host, b)
         stage_snapshot(host, d, prefix=--prefix)
@@ -57,6 +64,7 @@ CE1{
 
   plan.map{
     table = list(refs=refs/heads/*){branch, head_short, date_short, §}
+    state: STAGED(⧗) if sbx≠host; MATERIALIZED(✓) if equal
   }
 
   plan.diff{
@@ -64,23 +72,33 @@ CE1{
   }
 
   invariants{
-    idempotent(superpose; no changes)          // rerun → zero-diff
-    reversible(extract∘superpose)              // tree equality
-    no_history_rewrite                         // only add refs/objects
-    clean_host_and_children                    // abort on dirty states
-    deterministic_branch_names                 // sanitize(dir)
+    idempotent(superpose; no changes)
+    reversible(extract∘superpose)
+    fast_forward_only            // monotone promotion
+    no_history_rewrite
+    deterministic_branch_names
+    stable_passports
+  }
+
+  emergent{
+    deterministic_convergence
+    reversible_views
+    functorial_mapping(D→B)
+    minimal_churn_cadence
+    diff_as_dynamics
   }
 
   tests{
-    T1: fresh host + N repos → N branches; heads set; passports present
-    T2: rerun superpose --dry after --apply → no planned ops
+    T1: fresh host + N repos → N branches; passports present
+    T2: rerun superpose twice → no changes
     T3: dirty child repo → ✖ and host untouched
     T4: extract(superpose(dir)) reproduces repo (tree hash equal)
-    T5: snapshot mode (--include-non-git) → 1-commit branch with dir tree
+    T5: snapshot mode → 1-commit orphan branch
   }
 
   emit{
     report.table(dir|type|branch|head|§)
+    stderr: "blocked by host divergence" on non-FF
     stderr glyphs: ⧗ step, ↷ fetch, ✓ ok, ✖ abort
   }
 }

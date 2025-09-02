@@ -1,13 +1,13 @@
 # TIQ - Timeline Interleaver & Quantizer Makefile
 
-.PHONY: help install install-dev test lint format clean build docs
+.PHONY: help install install-uv install-dev test lint format clean clean-packaging build docs
 
 # Default target
 help:
 	@echo "TIQ - Timeline Interleaver & Quantizer"
 	@echo ""
 	@echo "Available targets:"
-	@echo "  install     Install TIQ and dependencies"
+	@echo "  install     Install TIQ via uv and clean packaging artifacts"
 	@echo "  install-dev Install TIQ with development dependencies"
 	@echo "  test        Run test suite"
 	@echo "  lint        Run linting checks"
@@ -19,7 +19,11 @@ help:
 
 # Installation
 install:
-	pip install -e .
+	uv tool install --from . tiq
+	$(MAKE) clean-packaging
+
+install-uv:
+	uv tool install --from . tiq
 
 install-dev:
 	pip install -e ".[dev,crypto]"
@@ -53,6 +57,14 @@ clean:
 	find . -type d -name __pycache__ -exec rm -rf {} +
 	find . -type f -name "*.pyc" -delete
 
+# Remove packaging/build system cruft; safe to call after install
+clean-packaging:
+	rm -rf build/
+	rm -rf dist/
+	rm -rf *.egg-info/
+	find . -type d -name __pycache__ -exec rm -rf {} +
+	find . -type f -name "*.pyc" -delete
+
 # Documentation
 docs:
 	@echo "Documentation is in README.md"
@@ -69,7 +81,7 @@ demo:
 	@echo "plain content" > demo/plain/plain_file.txt
 	@echo ""
 	@echo "Running TIQ superpose..."
-	@cd demo && python ../tiq.py superpose --apply --include-non-git
+	@cd demo && python ../tiq.py superpose --include-non-git -e content
 	@echo ""
 	@echo "Mapping branches..."
 	@cd demo && python ../tiq.py map

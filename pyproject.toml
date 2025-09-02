@@ -53,9 +53,8 @@ Repository = "https://github.com/your-org/tiq"
 Documentation = "https://github.com/your-org/tiq#readme"
 "Bug Tracker" = "https://github.com/your-org/tiq/issues"
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["tiq*"]
+[tool.setuptools]
+py-modules = ["tiq"]
 
 [tool.setuptools.package-data]
 tiq = ["*.ce1"]

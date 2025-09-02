@@ -31,15 +31,16 @@ class TIQConfig:
     host: str = "."
     dirs_depth: int = 1
     ignore: Optional[Set[str]] = None
-    dry_run: bool = True
-    apply: bool = False
-    force: bool = False
     include_non_git: bool = False
     prefix: Optional[str] = None
+    events: Optional[Set[str]] = None  # e.g., {"content", "cadence", "size", "host-moved"}
     
     def __post_init__(self):
         if self.ignore is None:
             self.ignore = {".git", ".venv", "node_modules"}
+        # Default event policy: materialize on content change
+        if not self.events:
+            self.events = {"content"}
 
 
 @dataclass
@@ -62,6 +63,11 @@ class TIQ:
     def __init__(self, config: TIQConfig):
         self.config = config
         self.host_path = Path(config.host).resolve()
+        # Energy threshold (bytes) for swaps; holds if exceeded
+        try:
+            self.energy_threshold = int(os.environ.get("TIQ_MAX_CHURN", "65536"))
+        except Exception:
+            self.energy_threshold = 65536
         
     def _run_git(self, args: List[str], cwd: Optional[Path] = None) -> Tuple[int, str, str]:
         """Run a git command and return (returncode, stdout, stderr)."""
@@ -84,16 +90,30 @@ class TIQ:
         """Check if a directory is a Git repository."""
         return (path / ".git").exists()
     
-    def _is_clean_repo(self, path: Path) -> bool:
-        """Check if a Git repository is clean (no uncommitted changes)."""
+    def _is_clean_repo(self, path: Path, *, ignore_untracked: bool = False) -> bool:
+        """Check if a Git repository is clean (no uncommitted changes).
+        If ignore_untracked is True, untracked files are ignored.
+        """
         if not self._is_git_repo(path):
             return True
-            
-        returncode, stdout, stderr = self._run_git(["status", "--porcelain"], cwd=path)
+        status_args = ["status", "--porcelain"]
+        if ignore_untracked:
+            status_args.append("--untracked-files=no")
+        returncode, stdout, stderr = self._run_git(status_args, cwd=path)
         if returncode != 0:
             raise TIQError(f"Failed to check git status in {path}: {stderr}")
-        
         return len(stdout) == 0
+
+    def _ensure_host_clean(self):
+        """Ensure host repo exists and is clean enough (ignore untracked)."""
+        if not self._is_git_repo(self.host_path):
+            rc, _, err = self._run_git(["init"], cwd=self.host_path)
+            if rc != 0:
+                raise TIQError(f"Failed to initialize host repository: {err}")
+            print("✓ initialized host repository")
+        else:
+            if not self._is_clean_repo(self.host_path, ignore_untracked=True):
+                raise TIQError("Host repository is not clean. Please commit or stash changes.")
     
     def _sanitize_branch_name(self, name: str) -> str:
         """Sanitize directory name to valid Git branch name."""
@@ -116,11 +136,23 @@ class TIQ:
                 dirs.append(item)
         
         return sorted(dirs)
+
+    def _get_directories_from(self, root: Path) -> List[Path]:
+        """Get first-level subdirectories from an arbitrary root, excluding ignored."""
+        if not root.exists():
+            return []
+        dirs: List[Path] = []
+        for item in root.iterdir():
+            if (item.is_dir() and
+                item.name not in (self.config.ignore or set()) and
+                not item.name.startswith(".")):
+                dirs.append(item)
+        return sorted(dirs)
     
     def _blake3_hash(self, data: bytes) -> str:
         """Compute BLAKE3 hash of data."""
         try:
-            import blake3
+            import blake3  # type: ignore[import-not-found]
             return blake3.blake3(data).hexdigest()[:8]
         except ImportError:
             # Fallback to SHA-256 if blake3 not available
@@ -129,125 +161,160 @@ class TIQ:
     def _crc16_hash(self, data: bytes) -> str:
         """Compute CRC16 hash of data."""
         return f"{zlib.crc32(data) & 0xFFFF:04x}"
-    
-    def _generate_passport(self, branch: str, tree_hash: str, meta: str) -> Passport:
-        """Generate passport for a branch."""
-        tree_data = tree_hash.encode()
-        meta_data = meta.encode()
-        
-        blake3_part = self._blake3_hash(tree_data)
-        crc16_part = self._crc16_hash(meta_data)
-        
-        tag = f"§{blake3_part}:{crc16_part}"
-        
-        # Get branch head info
-        returncode, head_short, _ = self._run_git(["rev-parse", "--short", "HEAD"])
-        if returncode != 0:
-            head_short = "unknown"
-        
-        # Get commit date
-        returncode, date_short, _ = self._run_git(["log", "-1", "--format=%cd", "--date=short"])
-        if returncode != 0:
-            date_short = "unknown"
-        
-        return Passport(
-            branch=branch,
-            tag=tag,
-            head_short=head_short,
-            date_short=date_short
-        )
-    
-    def _ensure_host_clean(self):
-        """Ensure host repository is clean or initialize it."""
-        if not self._is_git_repo(self.host_path):
-            if self.config.dry_run:
-                print("⧗ would initialize host repository")
-                return
-            returncode, _, stderr = self._run_git(["init"])
-            if returncode != 0:
-                raise TIQError(f"Failed to initialize host repository: {stderr}")
-            print("✓ initialized host repository")
-        else:
-            if not self._is_clean_repo(self.host_path):
-                raise TIQError("Host repository is not clean. Please commit or stash changes.")
-    
+
     def _add_remote_once(self, remote_name: str, remote_url: str):
         """Add remote if it doesn't exist."""
-        returncode, _, _ = self._run_git(["remote", "get-url", remote_name])
-        if returncode == 0:
-            return  # Remote already exists
-        
-        if self.config.dry_run:
-            print(f"⧗ would add remote {remote_name} -> {remote_url}")
+        rc, _, _ = self._run_git(["remote", "get-url", remote_name])
+        if rc == 0:
             return
-            
-        returncode, _, stderr = self._run_git(["remote", "add", remote_name, remote_url])
-        if returncode != 0:
-            raise TIQError(f"Failed to add remote {remote_name}: {stderr}")
+        rc2, _, err = self._run_git(["remote", "add", remote_name, remote_url])
+        if rc2 != 0:
+            raise TIQError(f"Failed to add remote {remote_name}: {err}")
         print(f"✓ added remote {remote_name}")
-    
+
     def _fetch_remote(self, remote_name: str):
-        """Fetch all refs from remote."""
-        if self.config.dry_run:
-            print(f"↷ would fetch {remote_name}")
-            return
-            
-        returncode, _, stderr = self._run_git([
-            "fetch", remote_name, 
+        """Fetch all branches and tags from the given remote."""
+        rc, _, err = self._run_git([
+            "fetch",
+            remote_name,
             "+refs/heads/*:refs/remotes/" + remote_name + "/*",
-            "--tags"
+            "--tags",
         ])
-        if returncode != 0:
-            raise TIQError(f"Failed to fetch {remote_name}: {stderr}")
+        if rc != 0:
+            raise TIQError(f"Failed to fetch {remote_name}: {err}")
         print(f"↷ fetched {remote_name}")
-    
+
+    def _generate_passport(self, branch: str, tree_hash: str, meta: str, ref_hint: Optional[str] = None, pre_head: Optional[str] = None, pre_date: Optional[str] = None) -> Passport:
+        """Generate passport for a branch with branch-scoped head/date.
+        Prefers pre_head/pre_date if provided. Otherwise, resolves via ref_hint/local refs.
+        """
+        blake8 = self._blake3_hash(tree_hash.encode())
+        crc = self._crc16_hash(meta.encode())
+        tag = f"§{blake8}:{crc}"
+
+        # Use precomputed head/date if supplied
+        head_short = pre_head or ""
+        date_short = pre_date or ""
+
+        # Resolve head deterministically if not provided
+        if not head_short:
+            if ref_hint:
+                rc_h, head_from_hint, _ = self._run_git(["rev-parse", "--short", ref_hint])
+                if rc_h == 0 and head_from_hint:
+                    head_short = head_from_hint
+                if not head_short:
+                    rc_hq, head_from_qhint, _ = self._run_git(["rev-parse", "--short", f"refs/remotes/{ref_hint}"])
+                    if rc_hq == 0 and head_from_qhint:
+                        head_short = head_from_qhint
+        if not head_short:
+            rc_show, show_out, _ = self._run_git(["show-ref", "--verify", f"refs/heads/{branch}"])
+            if rc_show == 0 and show_out:
+                full_hash = show_out.split()[0]
+                rc_sh, head_short_tmp, _ = self._run_git(["rev-parse", "--short", full_hash])
+                if rc_sh == 0 and head_short_tmp:
+                    head_short = head_short_tmp
+        if not head_short:
+            rc1, head_short2, _ = self._run_git(["rev-parse", "--short", branch])
+            head_short = head_short2 if rc1 == 0 and head_short2 else head_short
+        if not head_short:
+            rc1c, head_short3, _ = self._run_git(["rev-parse", "--short", "HEAD"])
+            head_short = head_short3 if rc1c == 0 and head_short3 else "unknown"
+
+        # Resolve date if not provided
+        if not date_short:
+            if ref_hint:
+                rc_dh, date_from_hint, _ = self._run_git(["log", "-1", "--format=%cd", "--date=short", ref_hint])
+                if rc_dh == 0 and date_from_hint:
+                    date_short = date_from_hint
+                if not date_short:
+                    rc_dhq, date_from_qhint, _ = self._run_git(["log", "-1", "--format=%cd", "--date=short", f"refs/remotes/{ref_hint}"])
+                    if rc_dhq == 0 and date_from_qhint:
+                        date_short = date_from_qhint
+        if not date_short:
+            rc2, date_b, _ = self._run_git(["log", "-1", "--format=%cd", "--date=short", branch])
+            date_short = date_b if rc2 == 0 and date_b else date_short
+        if not date_short:
+            rc2b, date_head, _ = self._run_git(["log", "-1", "--format=%cd", "--date=short", "HEAD"])
+            date_short = date_head if rc2b == 0 and date_head else "unknown"
+
+        return Passport(branch=branch, tag=tag, head_short=head_short, date_short=date_short)
+
     def _get_remote_head_or_first(self, remote_name: str) -> str:
-        """Get the head branch of remote or first available branch."""
-        # Try to get the default branch
-        returncode, head, _ = self._run_git(["symbolic-ref", f"refs/remotes/{remote_name}/HEAD"])
-        if returncode == 0:
-            return head.replace(f"refs/remotes/{remote_name}/", "")
-        
-        # Fallback to first branch
-        returncode, branches, _ = self._run_git(["branch", "-r", "--format=%(refname:short)"])
-        if returncode == 0 and branches:
-            for branch in branches.split("\n"):
-                if branch.startswith(f"{remote_name}/"):
-                    return branch.replace(f"{remote_name}/", "")
-        
-        raise TIQError(f"No branches found in remote {remote_name}")
-    
+        """Select a remote-qualified branch deterministically.
+        Prefer refs/remotes/<remote_name>/main or /master; else first alphabetical.
+        """
+        candidates: List[str] = []
+        rc, refs, _ = self._run_git(["for-each-ref", "--format=%(refname:short)", f"refs/remotes/{remote_name}"])
+        if rc == 0 and refs:
+            for ref in refs.split("\n"):
+                ref = ref.strip()
+                if ref and ref.startswith(f"{remote_name}/"):
+                    candidates.append(ref)
+        if not candidates:
+            raise TIQError(f"No branches found in remote {remote_name}")
+        # Prefer main/master
+        for preferred in ("main", "master"):
+            target = f"{remote_name}/{preferred}"
+            if target in candidates:
+                return target
+        # Deterministic fallback
+        return sorted(candidates)[0]
+
+    # --- ref helpers (no WT writes) ---------------------------------------
+    def _resolve_hash(self, ref: str, *, cwd: Optional[Path] = None) -> Optional[str]:
+        rc, out, _ = self._run_git(["rev-parse", ref], cwd=cwd or self.host_path)
+        return out if rc == 0 and out else None
+
+    def _update_ref(self, ref: str, new_hash: str, old_hash: Optional[str] = None) -> None:
+        args = ["update-ref", ref, new_hash]
+        if old_hash:
+            args.append(old_hash)
+        self._run_git(args)
+
+    def _compute_energy(self, old_hash: Optional[str], new_hash: str) -> int:
+        if not old_hash or old_hash == new_hash:
+            return 0
+        rc, out, _ = self._run_git([
+            "diff-tree", "-r", "-M90%", "-C90%", "--numstat", old_hash, new_hash
+        ])
+        if rc != 0 or not out:
+            return 0
+        energy = 0
+        for line in out.splitlines():
+            parts = line.split('\t')
+            if len(parts) >= 2:
+                try:
+                    add = 0 if parts[0] == '-' else int(parts[0])
+                    rem = 0 if parts[1] == '-' else int(parts[1])
+                    energy += max(0, add) + max(0, rem)
+                except Exception:
+                    continue
+        return int(energy)
+
+    def _branch_exists(self, branch_name: str) -> bool:
+        """Return True if local branch exists."""
+        rc, _, _ = self._run_git(["show-ref", "--verify", "--quiet", f"refs/heads/{branch_name}"])
+        return rc == 0
+
+    def _checkout_branch(self, branch_name: str):
+        """Deprecated: no WT writes; keep for compatibility if needed."""
+        rc, _, stderr = self._run_git(["symbolic-ref", "HEAD", f"refs/heads/{branch_name}"])
+        if rc != 0:
+            raise TIQError(f"Failed to set HEAD to {branch_name}: {stderr}")
+
     def _create_branch(self, branch_name: str, head: str):
-        """Create branch from head."""
-        if self.config.dry_run:
-            print(f"⧗ would create branch {branch_name} from {head}")
+        """Create branch ref pointing to head (no WT writes)."""
+        if self._branch_exists(branch_name):
+            print(f"✓ branch {branch_name} already exists; skipping create")
             return
-            
-        force_flag = ["-f"] if self.config.force else []
-        returncode, _, stderr = self._run_git(["checkout", "-b", branch_name, head] + force_flag)
-        if returncode != 0:
-            raise TIQError(f"Failed to create branch {branch_name}: {stderr}")
+        self._update_ref(f"refs/heads/{branch_name}", head)
         print(f"✓ created branch {branch_name}")
     
     def _switch_orphan(self, branch_name: str):
-        """Switch to orphan branch."""
-        if self.config.dry_run:
-            print(f"⧗ would switch to orphan branch {branch_name}")
-            return
-            
-        returncode, _, stderr = self._run_git(["checkout", "--orphan", branch_name])
-        if returncode != 0:
-            raise TIQError(f"Failed to switch to orphan branch {branch_name}: {stderr}")
-        print(f"✓ switched to orphan branch {branch_name}")
+        raise TIQError("Snapshot mode requires WT writes, which are disabled by invariants")
     
     def _stage_snapshot(self, source_dir: Path, prefix: Optional[str] = None):
-        """Stage snapshot of directory contents."""
-        if self.config.dry_run:
-            print(f"⧗ would stage snapshot of {source_dir}")
-            return
-            
-        # Clear staging area
-        self._run_git(["rm", "-rf", "--cached", "."])
+        raise TIQError("Staging snapshots is disabled (no WT writes)")
         
         # Copy files with optional prefix
         if prefix:
@@ -268,48 +335,136 @@ class TIQ:
         print(f"✓ staged snapshot of {source_dir}")
     
     def _commit_snapshot(self, message: str):
-        """Commit staged snapshot."""
-        if self.config.dry_run:
-            print(f"⧗ would commit: {message}")
-            return
-            
-        returncode, _, stderr = self._run_git(["commit", "-m", message])
-        if returncode != 0:
-            raise TIQError(f"Failed to commit snapshot: {stderr}")
-        print(f"✓ committed: {message}")
+        raise TIQError("Committing snapshots is disabled (no WT writes)")
     
+    def _with_sandbox(self, fn):
+        """Deprecated: ghost-refs flow runs in the real host without WT writes."""
+        source_root = self.host_path
+        return fn(source_root)
+
+    def _promote_sandbox_to_host(self, sandbox: Path, host: Path):
+        """Deprecated in ghost-refs flow."""
+        return
+
+    def _should_materialize(self, sandbox: Path, host: Path) -> bool:
+        """Evaluate -e/--event predicates. If none specified, never materialize."""
+        events = self.config.events or set()
+        if not events:
+            return False
+        decisions = []
+        # content: any branch tag differs between sandbox and host
+        if "content" in events:
+            # Compare branch tips by commit id
+            rc_s, s_branches, _ = self._run_git(["for-each-ref", "--format=%(refname:short) %(objectname)", "refs/heads"], cwd=sandbox)
+            rc_h, h_branches, _ = self._run_git(["for-each-ref", "--format=%(refname:short) %(objectname)", "refs/heads"], cwd=host)
+            sandbox_map = {}
+            host_map = {}
+            if rc_s == 0 and s_branches:
+                for line in s_branches.split("\n"):
+                    parts = line.strip().split()
+                    if len(parts) == 2:
+                        sandbox_map[parts[0]] = parts[1]
+            if rc_h == 0 and h_branches:
+                for line in h_branches.split("\n"):
+                    parts = line.strip().split()
+                    if len(parts) == 2:
+                        host_map[parts[0]] = parts[1]
+            diff_exists = any(sandbox_map.get(b) != host_map.get(b) for b in sandbox_map.keys())
+            decisions.append(diff_exists)
+        # cadence: placeholder (always true for now); can be time-based later
+        if "cadence" in events:
+            decisions.append(True)
+        # size: sandbox .git objects > threshold (placeholder threshold)
+        if "size" in events:
+            try:
+                total = 0
+                for root, _dirs, files in os.walk(sandbox / ".git"):
+                    for f in files:
+                        try:
+                            total += (Path(root) / f).stat().st_size
+                        except Exception:
+                            pass
+                decisions.append(total > 0)
+            except Exception:
+                decisions.append(False)
+        # host-moved: host refs changed since last run (we can't persist; treat as true if host has any refs)
+        if "host-moved" in events:
+            rc_h2, h2, _ = self._run_git(["for-each-ref", "refs/heads", "--count=1"], cwd=host)
+            decisions.append(rc_h2 == 0)
+        # AND all specified predicates
+        return all(decisions) if decisions else False
+
     def superpose(self) -> List[Passport]:
-        """Superpose directories as branches."""
-        print("⧗ superposing directories as branches...")
-        
+        """Superpose directories as branches using ghost refs and energy gating."""
+        print("↷ syncing directories as ghost refs...")
+
+        def _core(source_root: Path) -> List[Passport]:
+            passports: List[Passport] = []
+            for dir_path in self._get_directories_from(source_root):
+                branch_name = self._sanitize_branch_name(dir_path.name)
+                ref_hint = None
+                pre_head = None
+                pre_date = None
+                glyph = "↷"
+                reason = ""
+
+                if self._is_git_repo(dir_path):
+                    if not self._is_clean_repo(dir_path):
+                        raise TIQError(f"Repository {dir_path} is not clean")
+                    remote_name = f"tiq/{branch_name}"
+                    # Use file:// URL for robustness
+                    child_url = f"file://{dir_path}"
+                    self._add_remote_once(remote_name, child_url)
+                    self._fetch_remote(remote_name)
+                    target_ref = self._get_remote_head_or_first(remote_name)
+                    # Resolve target full hash
+                    full_hash = self._resolve_hash(target_ref)
+                    if not full_hash:
+                        raise TIQError(f"Failed to resolve target for {branch_name}")
+                    # Update ghost ref to target OID
+                    ghost_ref = f"refs/tiq/ghost/{branch_name}"
+                    self._update_ref(ghost_ref, full_hash)
+                    # Decide swap
+                    head_ref = f"refs/heads/{branch_name}"
+                    old_hash = self._resolve_hash(head_ref)
+                    energy = self._compute_energy(old_hash, full_hash)
+                    if energy <= self.energy_threshold:
+                        if not old_hash:
+                            self._update_ref(head_ref, full_hash)
+                            glyph = "✓"
+                        else:
+                            rc_ff, _, _ = self._run_git(["merge-base", "--is-ancestor", old_hash, full_hash])
+                            if rc_ff == 0:
+                                self._update_ref(head_ref, full_hash, old_hash)
+                                glyph = "✓"
+                            else:
+                                print(f"✖ blocked by host divergence: {branch_name} host={old_hash[:8]} ghost={full_hash[:8]}", file=sys.stderr)
+                                glyph = "✖"
+                                reason = "div"
+                    else:
+                        glyph = "⧗"
+                        reason = "ener"
+                    # Fill passport hints from target
+                    rc_hs, pre_head_val, _ = self._run_git(["rev-parse", "--short", full_hash])
+                    pre_head = pre_head_val if rc_hs == 0 and pre_head_val else None
+                    rc_ds, pre_date_val, _ = self._run_git(["log", "-1", "--format=%cd", "--date=short", full_hash])
+                    pre_date = pre_date_val if rc_ds == 0 and pre_date_val else None
+                    ref_hint = full_hash
+                elif self.config.include_non_git:
+                    # No WT writes allowed; hold
+                    glyph = "⧗"
+                    reason = "plain"
+                # Generate passport
+                passports.append(self._generate_passport(branch_name, "tree_hash", "meta", ref_hint=ref_hint, pre_head=pre_head, pre_date=pre_date))
+                # Emit table row immediately
+                head_short = passports[-1].head_short
+                print(f"{branch_name} | {glyph} | {head_short} | {passports[-1].tag} | {reason}")
+            return passports
+
+        # Ensure host is clean before operations (no uncommitted changes)
         self._ensure_host_clean()
-        passports = []
-        
-        for dir_path in self._get_directories():
-            branch_name = self._sanitize_branch_name(dir_path.name)
-            
-            if self._is_git_repo(dir_path):
-                # Handle Git repository
-                if not self._is_clean_repo(dir_path):
-                    raise TIQError(f"Repository {dir_path} is not clean")
-                
-                remote_name = f"tiq/{branch_name}"
-                self._add_remote_once(remote_name, str(dir_path))
-                self._fetch_remote(remote_name)
-                head = self._get_remote_head_or_first(remote_name)
-                self._create_branch(branch_name, head)
-                
-            elif self.config.include_non_git:
-                # Handle non-Git directory
-                self._switch_orphan(branch_name)
-                self._stage_snapshot(dir_path, self.config.prefix)
-                self._commit_snapshot(f"import {branch_name} (snapshot)")
-            
-            # Generate passport
-            passport = self._generate_passport(branch_name, "tree_hash", "meta")
-            passports.append(passport)
-        
-        return passports
+        # Run in-place with ghost refs
+        return self._with_sandbox(_core)
     
     def extract(self, branch: str, target: str):
         """Extract branch to standalone repository."""
@@ -317,10 +472,6 @@ class TIQ:
         
         target_path = Path(target)
         target_path.mkdir(parents=True, exist_ok=True)
-        
-        if self.config.dry_run:
-            print(f"⧗ would extract {branch} to {target}")
-            return
         
         # Initialize target repository
         returncode, _, stderr = self._run_git(["init"], cwd=target_path)
@@ -380,23 +531,22 @@ def main():
     parser = argparse.ArgumentParser(description="TIQ - Timeline Interleaver & Quantizer")
     parser.add_argument("verb", choices=[v.value for v in Verb], help="TIQ operation verb")
     parser.add_argument("--host", default=".", help="Host repository path")
-    parser.add_argument("--apply", action="store_true", help="Apply changes (default: dry run)")
-    parser.add_argument("--force", action="store_true", help="Allow force operations")
     parser.add_argument("--include-non-git", action="store_true", help="Include non-Git directories")
     parser.add_argument("--prefix", help="Prefix for snapshot operations")
     parser.add_argument("--branch", help="Branch name for extract operation")
     parser.add_argument("--target", help="Target path for extract operation")
     parser.add_argument("--left", help="Left branch for diff operation")
     parser.add_argument("--right", help="Right branch for diff operation")
+    parser.add_argument("-e", "--event", default="", help="Materialize predicate list: content,cadence,size,host-moved")
     
     args = parser.parse_args()
     
+    events = set([e.strip() for e in (args.event or "").split(',') if e.strip()])
     config = TIQConfig(
         host=args.host,
-        dry_run=not args.apply,
-        force=args.force,
         include_non_git=args.include_non_git,
-        prefix=args.prefix
+        prefix=args.prefix,
+        events=events
     )
     
     tiq = TIQ(config)
