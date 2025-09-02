@@ -1,0 +1,17 @@
+# TIQ - Timeline Interleaver & Quantizer Requirements
+
+# Core dependencies (minimal)
+# No external dependencies required for basic functionality
+
+# Optional dependencies for enhanced features
+blake3>=0.3.0  # For enhanced cryptographic hashing
+
+# Development dependencies
+pytest>=6.0
+pytest-cov>=2.0
+black>=21.0
+flake8>=3.8
+mypy>=0.800
+
+# Type checking support for older Python versions
+typing-extensions>=3.7.4; python_version<"3.8"

@@ -1,0 +1,86 @@
+CE1{
+  name=TIQ                      // Timeline Interleaver & Quantizer
+  glyph=⧗                       // tick
+  version=0.1
+  intent=dirs↔branches reversible.superposition
+
+  scope{
+    host="."                    // aggregator repo (init if absent)
+    dirs.depth=1                // only first-level subdirs
+    ignore={".git",".venv","node_modules"}
+  }
+
+  verbs{
+    superpose  = "dirs → branch-per-dir (no rewrite)"
+    extract    = "branch → standalone repo at target"
+    map        = "list branches + heads + passports"
+    diff       = "compare histories: left..right"
+  }
+
+  flags{
+    --dry (default)
+    --apply
+    --force                     // allow branch -f
+    --include-non-git           // snapshot plain dirs as orphan branches
+    --prefix=<path>             // snapshot under subpath
+  }
+
+  passport{
+    tag = § blake3(tree(branch))[:8] ":" crc16(meta)
+    cadence = per-branch-touch
+  }
+
+  plan.superpose{
+    ensure host is clean
+    for d in dirs(host; depth=1 \ ignore):
+      b = sanitize(d)
+      if is_git(d):
+        assert clean(d)
+        remote="tiq/"+b
+        add_remote_once(host, remote, d)
+        fetch(host, remote, "+refs/heads/*:refs/remotes/"+remote+"/*", tags=true)
+        head = remote_head_or_first(host, remote)
+        create_branch(host, b, head, force=--force)
+      else if --include-non-git:
+        switch_orphan(host, b)
+        stage_snapshot(host, d, prefix=--prefix)
+        commit(host, "import "+b+" (snapshot)")
+      emit passport(branch=b)
+  }
+
+  plan.extract{
+    input: branch, target
+    mkdir target; git init target
+    git -C target pull host branch
+    emit "⧗ extracted" branch "→" target
+  }
+
+  plan.map{
+    table = list(refs=refs/heads/*){branch, head_short, date_short, §}
+  }
+
+  plan.diff{
+    show git log --oneline left..right
+  }
+
+  invariants{
+    idempotent(superpose; no changes)          // rerun → zero-diff
+    reversible(extract∘superpose)              // tree equality
+    no_history_rewrite                         // only add refs/objects
+    clean_host_and_children                    // abort on dirty states
+    deterministic_branch_names                 // sanitize(dir)
+  }
+
+  tests{
+    T1: fresh host + N repos → N branches; heads set; passports present
+    T2: rerun superpose --dry after --apply → no planned ops
+    T3: dirty child repo → ✖ and host untouched
+    T4: extract(superpose(dir)) reproduces repo (tree hash equal)
+    T5: snapshot mode (--include-non-git) → 1-commit branch with dir tree
+  }
+
+  emit{
+    report.table(dir|type|branch|head|§)
+    stderr glyphs: ⧗ step, ↷ fetch, ✓ ok, ✖ abort
+  }
+}
