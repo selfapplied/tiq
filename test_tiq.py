@@ -344,6 +344,34 @@ class TestTIQInvariants(unittest.TestCase):
         self.assertNotEqual(head_before, head_after)
         self.assertEqual(head_after, ghost_hash)
 
+    def test_prune_removes_subset_branch(self):
+        """Prune should remove a branch that is subset of another"""
+        config = TIQConfig(host=str(self.host_dir))
+        tiq = TIQ(config)
+        tiq.superpose()
+        # Create a duplicate repo dir pointing to repo1 (clone into repo1_dup)
+        repo1_dup = self.host_dir / "repo1_dup"
+        subprocess.run(["git", "clone", str(self.repo1_dir),
+                       str(repo1_dup)], check=True)
+        # Commit to ensure distinct working copy, but same history initially
+        # Superpose again to add repo1_dup branch
+        tiq.superpose()
+        # Find subset pairs
+        pairs = tiq.find_subset_pairs()
+        # Expect repo1 or repo1_dup to be subset of the other
+        names = {a for (a, b) in pairs} | {b for (a, b) in pairs}
+        self.assertTrue("repo1" in names and any(
+            "repo1_dup" in n for n in names))
+        # Apply prune
+        pruned = tiq.prune(apply=True)
+        # Ensure one of the duplicate branches was removed
+        result = subprocess.run(
+            ["git", "branch", "--list"], cwd=self.host_dir, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0)
+        branches = [line.strip().replace("* ", "")
+                    for line in result.stdout.split("\n") if line.strip()]
+        self.assertFalse("repo1_dup" in branches and "repo1" in pruned)
+
 
 class TestTIQCLI(unittest.TestCase):
     """Test TIQ CLI interface."""

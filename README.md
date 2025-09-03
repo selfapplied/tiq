@@ -13,7 +13,8 @@ TIQ (Timeline Interleaver & Quantizer) is a sophisticated Git repository managem
 - **Classify**: In-memory mirror-kernel classification of branches vs ghost refs
 - **Emit**: Write mirror-kernel metadata to disk (JSON under .git)
 - **Reflect**: Persist mirror metadata into Git notes (no history rewrite)
- - **Rebalance**: Fast-forward heads to ghost refs when safe (no rewrite)
+- **Rebalance**: Fast-forward heads to ghost refs when safe (no rewrite)
+- **Rotate**: Promote mirror state across scales (notes → metadata → files)
 
 ## Key Features
 
@@ -110,6 +111,14 @@ python tiq.py reflect --mode notes --format ce1
 
 # Rebalance (FF-only) branches to their ghost refs
 python tiq.py rebalance
+
+# Rotate by scale
+#   notes: CE1 notes on commits
+#   metadata: tiq.branch.* keys in .git/config
+#   files: state committed to branch tiq/state (mirror.ce1 + rebalance.sh)
+python tiq.py rotate --mode notes
+python tiq.py rotate --mode metadata
+python tiq.py rotate --mode files
 ```
 
 ### Command Line Options

@@ -28,6 +28,8 @@ class Verb(Enum):
     EMIT = "emit"
     REFLECT = "reflect"
     REBALANCE = "rebalance"
+    ROTATE = "rotate"
+    PRUNE = "prune"
 
 
 @dataclass
@@ -765,6 +767,191 @@ class TIQ:
             print("No branches eligible for fast-forward rebalancing.")
         return updated
 
+    def _build_rebalance_script_lines(self) -> List[str]:
+        """Construct the rebalance script lines (FF-only with invariant checks)."""
+        _ = self.classify()
+        rc, branches_raw, _ = self._run_git(
+            ["for-each-ref", "--format=%(refname:short)", "refs/heads"])
+        branches = [b.strip() for b in (branches_raw.split(
+            "\n") if rc == 0 and branches_raw else []) if b.strip()]
+        script_lines: List[str] = []
+        script_lines.append("#!/usr/bin/env bash")
+        script_lines.append("set -euo pipefail")
+        script_lines.append("")
+        script_lines.append(
+            "# invariant: host repo is clean (ignore untracked)")
+        script_lines.append(
+            "if [[ -n \"$(git status --porcelain --untracked-files=no)\" ]]; then")
+        script_lines.append(
+            "  echo '✖ host repository is not clean' >&2; exit 1")
+        script_lines.append("fi")
+        script_lines.append("")
+        for branch in sorted(branches):
+            head_ref = f"refs/heads/{branch}"
+            ghost_ref = f"refs/tiq/ghost/{branch}"
+            script_lines.append(
+                f"# {branch}: fast-forward head to ghost if ancestor holds")
+            script_lines.append(
+                f"HOST=$(git rev-parse {head_ref} 2>/dev/null || echo '')")
+            script_lines.append(
+                f"GHOST=$(git rev-parse {ghost_ref} 2>/dev/null || echo '')")
+            script_lines.append("if [[ -n \"$HOST\" && -n \"$GHOST\" ]]; then")
+            script_lines.append(
+                "  if git merge-base --is-ancestor \"$HOST\" \"$GHOST\"; then")
+            script_lines.append(
+                f"    git update-ref {head_ref} \"$GHOST\" \"$HOST\"")
+            script_lines.append("  fi")
+            script_lines.append("fi")
+            script_lines.append("")
+        return script_lines
+
+    def rotate(self, scale: str = "notes", state_branch: str = "tiq/state") -> None:
+        """Rotate by scale: notes → config → files (state branch).
+
+        - notes: write CE1 notes per head under refs/notes/tiq
+        - metadata: write config keys tiq.branch.*
+        - files: materialize CE1 + rebalance.sh into branch state_branch via temp worktree
+        """
+        mode = scale.lower()
+        if mode == "notes":
+            self.reflect_metadata(mode="notes", fmt="ce1")
+            return
+        if mode == "metadata":
+            self.reflect_metadata(mode="config", fmt="ce1")
+            return
+        if mode != "files":
+            raise TIQError("scale must be one of: notes, metadata, files")
+
+        # Build contents
+        stats = self.classify()
+        ce1_lines: List[str] = []
+        for s in stats:
+            eq = 1 if s.equilibrium else 0
+            ff = 1 if s.fast_forward_possible else 0
+            ce1_lines.append(
+                f"CE1{{lens=MirrorKernel|branch={s.branch}|host={s.host_head}|ghost={s.ghost_head}|ahead={s.ahead}|behind={s.behind}|energy={s.energy}|eq={eq}|ff={ff}}}"
+            )
+        script_lines = self._build_rebalance_script_lines()
+
+        # Create temporary worktree and commit files to state_branch
+        tmpdir = Path(tempfile.mkdtemp(prefix="tiq_state_"))
+        try:
+            rc, _, _ = self._run_git(
+                ["worktree", "add", "-f", "-B", state_branch, str(tmpdir)])
+            if rc != 0:
+                raise TIQError("Failed to add worktree for state branch")
+            tiq_dir = tmpdir / ".tiq"
+            tiq_dir.mkdir(parents=True, exist_ok=True)
+            (tiq_dir / "mirror.ce1").write_text("\n".join(ce1_lines) + "\n")
+            (tiq_dir / "rebalance.sh").write_text("\n".join(script_lines) + "\n")
+            try:
+                os.chmod(tiq_dir / "rebalance.sh", 0o755)
+            except Exception:
+                pass
+            rc, _, err = self._run_git(["add", "."], cwd=tmpdir)
+            if rc != 0:
+                raise TIQError(f"Failed to add files in state worktree: {err}")
+            rc, _, _ = self._run_git(
+                ["commit", "-m", "tiq: rotate(files) update state"], cwd=tmpdir)
+        finally:
+            try:
+                self._run_git(["worktree", "remove", "--force", str(tmpdir)])
+            except Exception:
+                pass
+
+    # --- prune subset branches --------------------------------------------
+    def _list_heads(self) -> List[Tuple[str, str]]:
+        rc, out, _ = self._run_git(
+            ["for-each-ref", "--format=%(refname:short) %(objectname)", "refs/heads"])
+        heads: List[Tuple[str, str]] = []
+        if rc == 0 and out:
+            for line in out.split("\n"):
+                parts = line.strip().split()
+                if len(parts) == 2:
+                    heads.append((parts[0], parts[1]))
+        return heads
+
+    def find_subset_pairs(self) -> List[Tuple[str, str]]:
+        """Return pairs (subset_branch, superset_branch) where subset head is ancestor of superset head.
+
+        If heads are equal, deterministically choose the lexicographically larger name as subset.
+        """
+        heads = self._list_heads()
+        name_to_hash = {n: h for n, h in heads}
+        branches = sorted(name_to_hash.keys())
+        pairs: List[Tuple[str, str]] = []
+        for i, a in enumerate(branches):
+            ha = name_to_hash[a]
+            for b in branches:
+                if a == b:
+                    continue
+                hb = name_to_hash[b]
+                if ha == hb:
+                    # identical; remove lexicographically larger as subset
+                    subset, superset = (b, a) if b > a else (a, b)
+                    if subset == a:
+                        pairs.append((a, b))
+                    continue
+                # a ⊆ b if a is ancestor of b
+                rc, _, _ = self._run_git(
+                    ["merge-base", "--is-ancestor", ha, hb])
+                if rc == 0:
+                    pairs.append((a, b))
+                    break
+        return pairs
+
+    def prune(self, apply: bool = False, keep: Optional[Set[str]] = None) -> List[str]:
+        """Prune branches whose histories are complete subsets of others.
+
+        Prints plan and, if apply=True, deletes refs/heads/<branch>, corresponding
+        refs/tiq/ghost/<branch>, and clears tiq.branch.<branch>.* config keys.
+        Returns list of pruned branch names.
+        """
+        self._ensure_host_clean()
+        keep = keep or set()
+        pairs = self.find_subset_pairs()
+        # choose unique subsets to prune (prefer first detected superset)
+        to_prune: Dict[str, str] = {}
+        for subset, superset in pairs:
+            if subset in keep:
+                continue
+            if subset not in to_prune:
+                to_prune[subset] = superset
+        if not to_prune:
+            print("No subset branches detected.")
+            return []
+        for subset, superset in sorted(to_prune.items()):
+            print(f"⧗ subset: {subset} ⊆ {superset}")
+        pruned: List[str] = []
+        if apply:
+            for subset, _superset in to_prune.items():
+                head_ref = f"refs/heads/{subset}"
+                ghost_ref = f"refs/tiq/ghost/{subset}"
+                # delete refs if exist
+                self._run_git(["update-ref", "-d", head_ref])
+                self._run_git(["update-ref", "-d", ghost_ref])
+                # remove config keys
+                base = f"tiq.branch.{subset}"
+                self._run_git(
+                    ["config", "--local", "--unset-all", f"{base}.host"])
+                self._run_git(
+                    ["config", "--local", "--unset-all", f"{base}.ghost"])
+                self._run_git(
+                    ["config", "--local", "--unset-all", f"{base}.ahead"])
+                self._run_git(
+                    ["config", "--local", "--unset-all", f"{base}.behind"])
+                self._run_git(
+                    ["config", "--local", "--unset-all", f"{base}.energy"])
+                self._run_git(
+                    ["config", "--local", "--unset-all", f"{base}.eq"])
+                self._run_git(
+                    ["config", "--local", "--unset-all", f"{base}.ff"])
+                self._run_git(
+                    ["config", "--local", "--unset-all", f"{base}.head"])
+                print(f"✓ pruned {subset}")
+                pruned.append(subset)
+        return pruned
+
     def print_table(self, passports: List[Passport]):
         """Print passport table."""
         if not passports:
@@ -835,6 +1022,12 @@ def main():
             tiq.reflect_metadata(mode=args.mode, fmt=args.format)
         elif args.verb == Verb.REBALANCE.value:
             tiq.rebalance()
+        elif args.verb == Verb.ROTATE.value:
+            tiq.rotate(scale=args.mode)
+        elif args.verb == Verb.PRUNE.value:
+            # reuse --mode flag as boolean 'apply' if set to 'apply'
+            apply = (args.mode or "").lower() in ("apply", "true", "yes", "on")
+            tiq.prune(apply=apply)
     except TIQError as e:
         print(f"✖ {e}", file=sys.stderr)
         sys.exit(1)
