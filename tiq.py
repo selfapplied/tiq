@@ -12,6 +12,7 @@ import zlib
 import tempfile
 import shutil
 from pathlib import Path
+import json
 from typing import List, Dict, Optional, Tuple, Set
 from dataclasses import dataclass
 from enum import Enum
@@ -23,6 +24,10 @@ class Verb(Enum):
     EXTRACT = "extract"
     MAP = "map"
     DIFF = "diff"
+    CLASSIFY = "classify"
+    EMIT = "emit"
+    REFLECT = "reflect"
+    REBALANCE = "rebalance"
 
 
 @dataclass
@@ -57,6 +62,22 @@ class TIQError(Exception):
     pass
 
 
+@dataclass
+class MirrorStats:
+    """In-memory mirror kernel statistics for a branch.
+
+    Axis equilibrium corresponds to host_head == ghost_head (Fix(I)).
+    """
+    branch: str
+    host_head: str
+    ghost_head: str
+    ahead: int  # commits in host only (left)
+    behind: int  # commits in ghost only (right)
+    energy: int
+    equilibrium: bool
+    fast_forward_possible: bool
+
+
 class TIQ:
     """Timeline Interleaver & Quantizer - Core implementation."""
     
@@ -68,6 +89,8 @@ class TIQ:
             self.energy_threshold = int(os.environ.get("TIQ_MAX_CHURN", "65536"))
         except Exception:
             self.energy_threshold = 65536
+        # In-memory mirror statistics (rebuilt per run)
+        self._mirror_stats: List[MirrorStats] = []
         
     def _run_git(self, args: List[str], cwd: Optional[Path] = None) -> Tuple[int, str, str]:
         """Run a git command and return (returncode, stdout, stderr)."""
@@ -296,6 +319,26 @@ class TIQ:
         rc, _, _ = self._run_git(["show-ref", "--verify", "--quiet", f"refs/heads/{branch_name}"])
         return rc == 0
 
+    def _ahead_behind(self, left: Optional[str], right: Optional[str]) -> Tuple[int, int]:
+        """Return (ahead, behind) commit counts using symmetric difference.
+        left: host, right: ghost. If either is missing, return (0, 0).
+        """
+        if not left or not right:
+            return 0, 0
+        rc, out, _ = self._run_git(
+            ["rev-list", "--left-right", "--count", f"{left}...{right}"])
+        if rc != 0 or not out:
+            return 0, 0
+        parts = out.strip().split()
+        if len(parts) != 2:
+            return 0, 0
+        try:
+            ahead = int(parts[0])
+            behind = int(parts[1])
+        except Exception:
+            ahead, behind = 0, 0
+        return ahead, behind
+
     def _checkout_branch(self, branch_name: str):
         """Deprecated: no WT writes; keep for compatibility if needed."""
         rc, _, stderr = self._run_git(["symbolic-ref", "HEAD", f"refs/heads/{branch_name}"])
@@ -400,6 +443,8 @@ class TIQ:
 
         def _core(source_root: Path) -> List[Passport]:
             passports: List[Passport] = []
+            # reset mirror stats per run
+            self._mirror_stats = []
             for dir_path in self._get_directories_from(source_root):
                 branch_name = self._sanitize_branch_name(dir_path.name)
                 ref_hint = None
@@ -450,6 +495,24 @@ class TIQ:
                     rc_ds, pre_date_val, _ = self._run_git(["log", "-1", "--format=%cd", "--date=short", full_hash])
                     pre_date = pre_date_val if rc_ds == 0 and pre_date_val else None
                     ref_hint = full_hash
+                    # Compute mirror stats
+                    host_hash = self._resolve_hash(head_ref) or ""
+                    ghost_hash = full_hash or ""
+                    ahead, behind = self._ahead_behind(host_hash, ghost_hash)
+                    eq = bool(host_hash) and host_hash == ghost_hash
+                    rc_ff2, _, _ = self._run_git(
+                        ["merge-base", "--is-ancestor", host_hash or "HEAD", ghost_hash]) if host_hash and ghost_hash else (1, "", "")
+                    fast_fwd = rc_ff2 == 0
+                    self._mirror_stats.append(MirrorStats(
+                        branch=branch_name,
+                        host_head=(host_hash[:8] if host_hash else ""),
+                        ghost_head=(ghost_hash[:8] if ghost_hash else ""),
+                        ahead=ahead,
+                        behind=behind,
+                        energy=energy,
+                        equilibrium=eq,
+                        fast_forward_possible=fast_fwd,
+                    ))
                 elif self.config.include_non_git:
                     # No WT writes allowed; hold
                     glyph = "⧗"
@@ -510,6 +573,198 @@ class TIQ:
         
         print(output)
     
+    # --- mirror kernel / classifier ---------------------------------------
+    def classify(self) -> List[MirrorStats]:
+        """Classify branches w.r.t. ghost reflections (in-memory tracker).
+
+        Returns the latest mirror stats; also prints a compact table.
+        """
+        self._ensure_host_clean()
+        stats: List[MirrorStats] = []
+        # Rebuild from current refs to avoid stale state
+        rc, branches_raw, _ = self._run_git(
+            ["for-each-ref", "--format=%(refname:short)", "refs/heads"])
+        branches = [b.strip() for b in (branches_raw.split(
+            "\n") if rc == 0 and branches_raw else []) if b.strip()]
+        for branch in sorted(branches):
+            head_ref = f"refs/heads/{branch}"
+            ghost_ref = f"refs/tiq/ghost/{branch}"
+            host_hash = self._resolve_hash(head_ref)
+            ghost_hash = self._resolve_hash(ghost_ref)
+            ahead, behind = self._ahead_behind(host_hash, ghost_hash)
+            energy = self._compute_energy(
+                host_hash, ghost_hash or "") if ghost_hash else 0
+            eq = bool(host_hash and ghost_hash and host_hash == ghost_hash)
+            rc_ff, _, _ = self._run_git(
+                ["merge-base", "--is-ancestor", host_hash or "HEAD", ghost_hash]) if host_hash and ghost_hash else (1, "", "")
+            fast_fwd = rc_ff == 0
+            stats.append(MirrorStats(
+                branch=branch,
+                host_head=(host_hash[:8] if host_hash else ""),
+                ghost_head=(ghost_hash[:8] if ghost_hash else ""),
+                ahead=ahead,
+                behind=behind,
+                energy=energy,
+                equilibrium=eq,
+                fast_forward_possible=fast_fwd,
+            ))
+        # Store and print
+        self._mirror_stats = stats
+        if stats:
+            print("\nMirror Kernel (axis equilibrium = host==ghost):")
+            print("branch | host | ghost | ahead | behind | energy | eq | ff")
+            print("-" * 70)
+            for s in stats:
+                print(f"{s.branch} | {s.host_head} | {s.ghost_head} | {s.ahead} | {s.behind} | {s.energy} | {int(s.equilibrium)} | {int(s.fast_forward_possible)}")
+        else:
+            print("No branches to classify.")
+        return stats
+
+    def emit_metadata(self, out_path: Optional[str] = None) -> Path:
+        """Emit a bash script that verifies invariants then fast-forwards heads.
+
+        Default path: .git/tiq/rebalance.sh. No working tree writes.
+        """
+        # Build fresh stats (for branch enumeration only)
+        _ = self.classify()
+        rc, branches_raw, _ = self._run_git(
+            ["for-each-ref", "--format=%(refname:short)", "refs/heads"])
+        branches = [b.strip() for b in (branches_raw.split(
+            "\n") if rc == 0 and branches_raw else []) if b.strip()]
+        script_lines: List[str] = []
+        script_lines.append("#!/usr/bin/env bash")
+        script_lines.append("set -euo pipefail")
+        script_lines.append("")
+        script_lines.append(
+            "# invariant: host repo is clean (ignore untracked)")
+        script_lines.append(
+            "if [[ -n \"$(git status --porcelain --untracked-files=no)\" ]]; then")
+        script_lines.append(
+            "  echo '✖ host repository is not clean' >&2; exit 1")
+        script_lines.append("fi")
+        script_lines.append("")
+        for branch in sorted(branches):
+            head_ref = f"refs/heads/{branch}"
+            ghost_ref = f"refs/tiq/ghost/{branch}"
+            script_lines.append(
+                f"# {branch}: fast-forward head to ghost if ancestor holds")
+            script_lines.append(
+                f"HOST=$(git rev-parse {head_ref} 2>/dev/null || echo '')")
+            script_lines.append(
+                f"GHOST=$(git rev-parse {ghost_ref} 2>/dev/null || echo '')")
+            script_lines.append("if [[ -n \"$HOST\" && -n \"$GHOST\" ]]; then")
+            script_lines.append(
+                "  if git merge-base --is-ancestor \"$HOST\" \"$GHOST\"; then")
+            script_lines.append(
+                f"    git update-ref {head_ref} \"$GHOST\" \"$HOST\"")
+            script_lines.append("  fi")
+            script_lines.append("fi")
+            script_lines.append("")
+        # Write script file
+        if out_path:
+            target = Path(out_path)
+        else:
+            git_dir = self.host_path / ".git"
+            if not git_dir.exists():
+                raise TIQError("Host is not a Git repository (missing .git)")
+            target = git_dir / "tiq" / "rebalance.sh"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("\n".join(script_lines))
+        print(f"✓ emitted rebalance script → {target}")
+        return target
+
+    def reflect_metadata(self, mode: str = "notes", fmt: str = "json") -> None:
+        """Persist mirror stats into Git metadata.
+
+        mode=notes: attach notes under refs/notes/tiq for each branch head.
+        mode=config: write stats under git config keys tiq.branch.<name>.*
+        mode=both: do both of the above.
+        """
+        mode_lc = mode.lower()
+        if mode_lc not in ("notes", "config", "both"):
+            raise TIQError("mode must be one of: notes, config, both")
+        if fmt.lower() != "ce1":
+            raise TIQError("Only ce1 format is supported for reflect")
+        # Ensure repository present and fresh stats
+        self._ensure_host_clean()
+        stats = self.classify()
+        # For each branch, resolve full head hash and attach a note
+        for s in stats:
+            head_ref = f"refs/heads/{s.branch}"
+            full_hash = self._resolve_hash(head_ref)
+            if not full_hash:
+                continue
+            # ce1 compact block only
+            eq = 1 if s.equilibrium else 0
+            ff = 1 if s.fast_forward_possible else 0
+            message = (
+                f"CE1{{lens=MirrorKernel|branch={s.branch}|host={s.host_head}|ghost={s.ghost_head}|"
+                f"ahead={s.ahead}|behind={s.behind}|energy={s.energy}|eq={eq}|ff={ff}}}"
+            )
+            # notes
+            if mode_lc in ("notes", "both"):
+                rc, _, err = self._run_git([
+                    "notes", "--ref=refs/notes/tiq", "add", "-f", "-m", message, full_hash
+                ])
+                if rc != 0:
+                    raise TIQError(
+                        f"Failed to write note for {s.branch}: {err}")
+                print(f"✓ reflected {s.branch} → notes@{full_hash[:8]}")
+            # config keys
+            if mode_lc in ("config", "both"):
+                base = f"tiq.branch.{s.branch}"
+                kvs = {
+                    f"{base}.host": s.host_head,
+                    f"{base}.ghost": s.ghost_head,
+                    f"{base}.ahead": str(s.ahead),
+                    f"{base}.behind": str(s.behind),
+                    f"{base}.energy": str(s.energy),
+                    f"{base}.eq": "1" if s.equilibrium else "0",
+                    f"{base}.ff": "1" if s.fast_forward_possible else "0",
+                    f"{base}.head": full_hash,
+                }
+                for key, val in kvs.items():
+                    rc, _, err = self._run_git(
+                        ["config", "--local", "--replace-all", key, val])
+                    if rc != 0:
+                        raise TIQError(f"Failed to set {key}: {err}")
+                print(
+                    f"✓ reflected {s.branch} → config tiq.branch.{s.branch}.*")
+
+    def rebalance(self) -> List[str]:
+        """Fast-forward branches to their ghost refs when safe.
+
+        Only moves refs/heads/<branch> if host is ancestor of ghost. Ignores energy gating.
+        Returns list of updated branch names.
+        """
+        self._ensure_host_clean()
+        updated: List[str] = []
+        # Recompute current branches
+        rc, branches_raw, _ = self._run_git(
+            ["for-each-ref", "--format=%(refname:short)", "refs/heads"])
+        branches = [b.strip() for b in (branches_raw.split(
+            "\n") if rc == 0 and branches_raw else []) if b.strip()]
+        for branch in sorted(branches):
+            head_ref = f"refs/heads/{branch}"
+            ghost_ref = f"refs/tiq/ghost/{branch}"
+            host_hash = self._resolve_hash(head_ref)
+            ghost_hash = self._resolve_hash(ghost_ref)
+            if not host_hash or not ghost_hash:
+                continue
+            # Only fast-forward moves
+            rc_ff, _, _ = self._run_git(
+                ["merge-base", "--is-ancestor", host_hash, ghost_hash])
+            if rc_ff != 0:
+                continue
+            if host_hash == ghost_hash:
+                continue
+            self._update_ref(head_ref, ghost_hash, host_hash)
+            print(f"✓ rebalanced {branch}: {host_hash[:8]} → {ghost_hash[:8]}")
+            updated.append(branch)
+        if not updated:
+            print("No branches eligible for fast-forward rebalancing.")
+        return updated
+
     def print_table(self, passports: List[Passport]):
         """Print passport table."""
         if not passports:
@@ -535,6 +790,12 @@ def main():
     parser.add_argument("--prefix", help="Prefix for snapshot operations")
     parser.add_argument("--branch", help="Branch name for extract operation")
     parser.add_argument("--target", help="Target path for extract operation")
+    parser.add_argument(
+        "--out", help="Output path for emit operation (default: .git/tiq/mirror.json)")
+    parser.add_argument("--format", default="json",
+                        help="Output/reflect format (json|ce1)")
+    parser.add_argument("--mode", default="notes",
+                        help="Reflect mode (notes)")
     parser.add_argument("--left", help="Left branch for diff operation")
     parser.add_argument("--right", help="Right branch for diff operation")
     parser.add_argument("-e", "--event", default="", help="Materialize predicate list: content,cadence,size,host-moved")
@@ -566,6 +827,14 @@ def main():
             if not args.left or not args.right:
                 raise TIQError("Diff requires --left and --right")
             tiq.diff_branches(args.left, args.right)
+        elif args.verb == Verb.CLASSIFY.value:
+            tiq.classify()
+        elif args.verb == Verb.EMIT.value:
+            tiq.emit_metadata(out_path=args.out)
+        elif args.verb == Verb.REFLECT.value:
+            tiq.reflect_metadata(mode=args.mode, fmt=args.format)
+        elif args.verb == Verb.REBALANCE.value:
+            tiq.rebalance()
     except TIQError as e:
         print(f"✖ {e}", file=sys.stderr)
         sys.exit(1)

@@ -10,6 +10,10 @@ TIQ (Timeline Interleaver & Quantizer) is a sophisticated Git repository managem
 - **Extract**: Extract branches back into standalone repositories  
 - **Map**: List all branches with their cryptographic passports
 - **Diff**: Compare histories between branches
+- **Classify**: In-memory mirror-kernel classification of branches vs ghost refs
+- **Emit**: Write mirror-kernel metadata to disk (JSON under .git)
+- **Reflect**: Persist mirror metadata into Git notes (no history rewrite)
+ - **Rebalance**: Fast-forward heads to ghost refs when safe (no rewrite)
 
 ## Key Features
 
@@ -94,6 +98,18 @@ python tiq.py extract --branch my-branch --target /path/to/extract
 
 # Compare branch histories
 python tiq.py diff --left branch1 --right branch2
+
+# Classify mirror equilibrium (host vs ghost)
+python tiq.py classify
+
+# Emit a safe rebalance script (verifies invariants + FF-only)
+python tiq.py emit --out .git/tiq/rebalance.sh
+
+# Reflect mirror metadata into Git notes (CE1 format)
+python tiq.py reflect --mode notes --format ce1
+
+# Rebalance (FF-only) branches to their ghost refs
+python tiq.py rebalance
 ```
 
 ### Command Line Options
@@ -218,6 +234,38 @@ tiq/
 ├── pyproject.toml   # Python project configuration
 ├── Makefile         # Build and test commands
 └── LICENSE          # License file
+```
+
+## Mirror Kernel (CE1: lens=MirrorKernel)
+
+The mirror-kernel tracks Git metadata in memory by reflecting each branch `refs/heads/<b>` against its ghost `refs/tiq/ghost/<b>` produced during superpose. It reports per-branch statistics:
+
+- branch | host | ghost | ahead | behind | energy | eq | ff
+- **eq**: 1 if host head equals ghost head (axis equilibrium)
+- **ahead/behind**: commit counts (host-only vs ghost-only) via `rev-list --left-right --count`
+- **energy**: approximate churn computed from `diff-tree --numstat`
+- **ff**: 1 if host is ancestor of ghost (fast-forward possible)
+
+Run:
+
+```bash
+python tiq.py classify
+```
+
+This is read-only and maintains all invariants: no working tree writes, no history rewrite.
+
+### Emitting Mirror Metadata
+
+By default, the emit command writes to `.git/tiq/mirror.json`:
+
+```bash
+python tiq.py emit
+```
+
+Custom path and (currently only) JSON format:
+
+```bash
+python tiq.py emit --out /tmp/mirror.json --format json
 ```
 
 ### Building

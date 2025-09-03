@@ -260,6 +260,90 @@ class TestTIQInvariants(unittest.TestCase):
             print_calls = [call[0][0] for call in mock_print.call_args_list]
             self.assertTrue(any("⧗ comparing" in msg for msg in print_calls))
 
+    def test_classify_equilibrium_and_divergence(self):
+        """Mirror classify reports equilibrium and divergence with ff flags"""
+        config = TIQConfig(
+            host=str(self.host_dir)
+        )
+        tiq = TIQ(config)
+
+        # Superpose to create branches and ghost refs
+        tiq.superpose()
+
+        # Initial classify: repo1 and repo2 should exist
+        with patch('builtins.print') as mock_print:
+            stats = tiq.classify()
+            self.assertTrue(len(stats) >= 2)
+            # At least one branch should show eq or ff
+            self.assertTrue(
+                any(s.equilibrium or s.fast_forward_possible for s in stats))
+
+        # Create divergence on repo1 child and fetch into ghost by re-running superpose
+        (self.repo1_dir / "div.txt").write_text("diverge")
+        subprocess.run(["git", "add", "."], cwd=self.repo1_dir, check=True)
+        subprocess.run(["git", "commit", "-m", "diverge"],
+                       cwd=self.repo1_dir, check=True)
+
+        # Re-run superpose to refresh ghost refs; host may fast-forward or block on divergence
+        tiq.superpose()
+
+        stats2 = tiq.classify()
+        repo1_stats = [s for s in stats2 if s.branch == "repo1"]
+        self.assertTrue(len(repo1_stats) == 1)
+        s1 = repo1_stats[0]
+        # After a new commit in child, if host couldn't fast-forward, no equilibrium
+        if not s1.fast_forward_possible:
+            self.assertFalse(s1.equilibrium)
+
+    def test_emit_metadata_creates_script(self):
+        """Emit should write rebalance.sh under .git/tiq by default"""
+        config = TIQConfig(host=str(self.host_dir))
+        tiq = TIQ(config)
+        # Create branches/ghosts
+        tiq.superpose()
+        # Emit
+        out_path = tiq.emit_metadata()
+        self.assertTrue(out_path.exists())
+        self.assertTrue(out_path.name.endswith("rebalance.sh"))
+
+    def test_reflect_writes_git_notes(self):
+        """Reflect should write notes under refs/notes/tiq for each branch"""
+        config = TIQConfig(host=str(self.host_dir))
+        tiq = TIQ(config)
+        tiq.superpose()
+        # Reflect into notes
+        tiq.reflect_metadata(mode="notes", fmt="ce1")
+        # Verify at least one branch has a note
+        result = subprocess.run([
+            "git", "notes", "--ref=refs/notes/tiq", "list"
+        ], cwd=self.host_dir, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0)
+        self.assertTrue(result.stdout.strip() != "")
+
+    def test_rebalance_fast_forwards_branch_to_ghost(self):
+        """Rebalance should FF host branch to ghost after child advances"""
+        config = TIQConfig(host=str(self.host_dir))
+        tiq = TIQ(config)
+        # Initial superpose and capture host head for repo1
+        tiq.superpose()
+        head_before = subprocess.run(["git", "rev-parse", "refs/heads/repo1"],
+                                     cwd=self.host_dir, capture_output=True, text=True, check=False).stdout.strip()
+        # Advance child repo1
+        (self.repo1_dir / "adv.txt").write_text("advance")
+        subprocess.run(["git", "add", "."], cwd=self.repo1_dir, check=True)
+        subprocess.run(["git", "commit", "-m", "advance"],
+                       cwd=self.repo1_dir, check=True)
+        # Refresh ghost via superpose (host may not FF automatically)
+        tiq.superpose()
+        ghost_hash = subprocess.run(["git", "rev-parse", "refs/tiq/ghost/repo1"],
+                                    cwd=self.host_dir, capture_output=True, text=True, check=False).stdout.strip()
+        # Rebalance should FF to ghost
+        tiq.rebalance()
+        head_after = subprocess.run(["git", "rev-parse", "refs/heads/repo1"],
+                                    cwd=self.host_dir, capture_output=True, text=True, check=False).stdout.strip()
+        self.assertNotEqual(head_before, head_after)
+        self.assertEqual(head_after, ghost_hash)
+
 
 class TestTIQCLI(unittest.TestCase):
     """Test TIQ CLI interface."""
